@@ -1,0 +1,98 @@
+# ==============================================================================
+# Road-MoME 全局配置文件 (v9.5 云端 E2E 专属版)
+# 架构跃迁：纯 PyTorch 3D 骨干 + 活体 ConvNeXt 端到端 + 动态致盲平权
+# 核心注入：AMP 混合精度 + Focal Loss + 3D 软置信度兜底
+# ==============================================================================
+
+# 1. 路径管理 (已重构为相对路径，完美适配 Linux Docker/云容器)
+# 注意：以下所有路径均相对于项目根目录 (project_root)
+# ------------------------------------------------------------------------------
+paths:
+  raw_pcd_dir: "./data/RSRD-dense"                # 原始 PCD 存放路径
+  raw_img_dir: "./data/RSRD-dense"                     # 原始 JPG 存放路径
+  output_dir: "./data/frame_packages_densefull"        # 预处理输出的 npz 目录
+  manual_label_path: "./data/manual_visual_gt_cloud.json"    # 2D 纯手工真值路径
+  log_dir: "./logs"
+  checkpoint_dir: "./pretrained_models"
+  vis_output_dir: "./data/inference_vis_v9.5"
+  weights:
+    point_mae: "./pretrained_models/pretrain.pth"      # 官方 C++ 预训练权重 (将被自动映射)
+    mome_model: "./pretrained_models/road_mome_v9_e2e_best.pth" # 端到端最新权重
+
+# 2. 训练配置 (v9.5 终极进化版)
+# ------------------------------------------------------------------------------
+training:
+  experiment_name: "MoME_v9.5_Cloud_E2E"
+  seed: 42
+  epochs: 60
+  
+  # 【⚠️ 核心警告】：端到端模式下，1个 bs 代表 1张 1008x560 的原图计算图。
+  # RTX 5090 (32GB) 建议设为 16 或 32。绝不可使用原来的 63！
+  batch_size: 16 
+  learning_rate: 0.0001
+  pos_weight: 5.0
+  val_split: 0.15
+  lambda_vis: 2.5         
+  mu_consistency: 1.2     
+  gamma_uncertainty: 0.15 
+  
+  # [v9.5 新增]: AMP 混合精度开关 (RTX 5090 必须开启，显存减半)
+  amp_enabled: true
+  
+  # [v9.5 新增]: Focal Loss 调制系数 (替代 BCE，死磕困难样本)
+  focal_loss_gamma: 2.0
+  
+  # [v9.5 新增]: 3D 软置信度加权 (缓解硬阈值边缘的梯度撕裂)
+  soft_confidence_range: [0.025, 0.035] # 绝对高度差的模糊临界区 (单位: m)
+  soft_confidence_weight: 0.1           # 落在该区间时的 Loss 惩罚衰减倍率
+
+  # 注：此处静态屏蔽概率已废弃。现在由 scripts/3_train_mome.py 中的 
+  # get_dynamic_blindness_prob 动态接管 (30% -> 70% 线性递增)
+  modal_mask_prob: 0.3    
+  resume: false
+  save_best: true
+  sanity_check:
+    ignore_corrupt: true
+
+# 3. 特征维度 (已对齐 E2E 引擎输出)
+# ------------------------------------------------------------------------------
+features:
+  phys: { key_name: "phys_8d", input_dim: 8 }
+  3d:   { key_name: "deep_512d", input_dim: 384 }
+  # 2D 维度锁定 1024。虽然 npz 中的离线特征不再被读取，
+  # 但模型初始化 MoMEGatingNetwork 时依赖此参数动态生成 Linear 层！
+  2d:   { key_name: "deep_2d_1024d", input_dim: 1024 } 
+  shared_dim: 128 
+
+# 4. 几何与空间参数 (绝对物理基准)
+# ------------------------------------------------------------------------------
+# 目标：Rows=9, Cols=7, Total=63 个绝对对齐网格
+geometry:
+  roi_x: [-3, 3]       
+  roi_y: [-8, -1]      
+  patch_size_x: 0.85   
+  patch_size_y: 0.77   
+  overlap: 0.0         
+  th_anomaly: 0.05
+  sigma_q: 0.015
+  max_patches: 63      
+
+# 5. 点云采样规格 (与 Point-MAE 架构硬绑定)
+# ------------------------------------------------------------------------------
+sampling:
+  n_points: 8192
+  k_z_stretch: 10.0
+  trans_dim: 384
+
+# 6. 推理与诊断控制
+# ------------------------------------------------------------------------------
+inference:
+  mode: "random"       
+  batch_limit: 10
+  inference_batch_size: 8
+  select_files: 
+    - "20230317075731.600"
+    - "20230317075643.200"
+  q2_default: 0.8
+  save_plots: true
+  show_plots: false

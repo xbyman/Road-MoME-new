@@ -1,0 +1,18 @@
+# GPU加速依赖（可选）
+# 只有在想使用GPU加速时才需要安装
+
+# 对于CUDA 11.x
+# cupy-cuda11x >= 10.0
+
+# 对于CUDA 12.x  
+# cupy-cuda12x >= 10.0
+
+# 检查CUDA版本：nvcc --version
+
+# 安装命令：
+# pip install cupy-cuda11x   (for CUDA 11.x)
+# pip install cupy-cuda12x   (for CUDA 12.x)
+
+# 或使用conda：
+# conda install -c conda-forge cupy cuda-version=11.x
+# conda install -c conda-forge cupy cuda-version=12.x
