@@ -1,10 +1,24 @@
 """
-Road-MoME 端到端终极训练引擎 (v10.1 精准索引对齐版)
+Road-MoME 端到端训练引擎 (v14.0)
 
-核心重构：
-1. 索引制导加载：优先读取 dataset_indexer 生成的标准索引，废弃 rglob 盲搜，确保数据读取 100% 严谨。
-2. 数据大盘盘点：在数据集初始化阶段实时输出 NPZ、索引和对齐后的精确数量，直接拦截 num_samples=0 报错。
-3. 致命级防错：强制挂载 manual_label_path (JSON)，若未读取到有效标注数据，直接触发 RuntimeError 中断训练。
+本版本在 v12.0 基础上叠加三项确定性改进：
+
+③ CrossModalAttention padding mask（mome_model.py 已修复）：
+   盲区 patch 不再作为 Key/Value 参与注意力计算，有效 patch 注意力集中。
+
+④ 噪声帧重加权：
+   has_gt=0（纯伪标签帧）的损失整体乘以 pseudo_frame_weight（默认 0.5），
+   让模型把更多学习资源集中在人工标注的干净帧上，
+   改善训练集 F1 < 验证集 F1 的倒置异常。
+
+⑤ CosineAnnealingLR 学习率调度：
+   替换全程固定 lr，后期 epoch 精细收敛，
+   缓解 v12 Epoch 69 达峰后下滑的震荡问题。
+
+损失函数逻辑回归 v12：
+   loss_tex     ← target_gt（人工 GT，保持 Precision 优势）
+   loss_phys/geom ← target_pseudo（伪标签，保持原有平衡）
+   loss_fusion  ← target_fusion = max(pseudo, gt)
 """
 
 import os
@@ -15,7 +29,7 @@ import cv2
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import random
@@ -189,60 +203,89 @@ class E2EDataset(Dataset):
             "has_gt": torch.tensor(has_gt).float(),
         }
 
-def mome_loss_v9_5(
+def mome_loss_v14(
     final_logit, internals, f3_stats, target_pseudo, target_gt,
     valid_mask, has_gt, pos_weight_val, is_blind, cfg
 ):
+    """
+    v14.0 损失函数
+
+    监督目标（回归 v12 逻辑，保留 Precision 优势）：
+      loss_fusion  ← target_fusion = max(pseudo, gt)   完整异常集合
+      loss_phys    ← target_pseudo                     伪标签（3D 障碍物）
+      loss_geom    ← target_pseudo                     伪标签（3D 障碍物）
+      loss_tex     ← target_gt                         人工 GT（裂缝/坑洞）
+
+    新增 ④ 噪声帧重加权：
+      has_gt=0 的纯伪标签帧损失乘以 pseudo_frame_weight（默认 0.5），
+      减少噪声标注对梯度的污染，提升学习效率。
+      has_gt=1 的帧权重保持 1.0（满权重训练）。
+    """
     device = final_logit.device
     pos_weight_tensor = torch.tensor([pos_weight_val], device=device)
-    gamma = cfg.get("training", {}).get("focal_loss_gamma", 2.0)
+    gamma    = cfg.get("training", {}).get("focal_loss_gamma", 2.0)
+    expert_w = cfg.get("training", {}).get("expert_loss_weight", 0.4)
+    # ④ 噪声帧重加权系数（可在 config 中覆盖）
+    pseudo_frame_w = cfg.get("training", {}).get("pseudo_frame_weight", 0.5)
     loss_func = FocalLossWithLogits(gamma=gamma, pos_weight=pos_weight_tensor)
 
-    loss_phys = loss_func(internals["pred_phys"], target_pseudo)
-    loss_geom = loss_func(internals["pred_geom"], target_pseudo)
+    # 完整异常集合
+    target_fusion = torch.max(target_pseudo, target_gt)   # [B, 63]
 
-    delta_z_idx = 2 
-    delta_z = f3_stats[:, :, delta_z_idx]
-    soft_range = cfg.get("training", {}).get("soft_confidence_range", [0.025, 0.035])
+    # --------------------------------------------------
+    # 各路损失
+    # --------------------------------------------------
+    loss_fusion = loss_func(final_logit,                   target_fusion)
+    loss_phys   = loss_func(internals["pred_phys"],        target_pseudo)
+    loss_geom   = loss_func(internals["pred_geom"],        target_pseudo)
+    loss_tex    = loss_func(internals["pred_tex"],         target_gt)
+
+    # 软置信度降权：点云模糊区域降权（仅 Phys/Geom）
+    delta_z_idx     = 2
+    delta_z         = f3_stats[:, :, delta_z_idx]
+    soft_range      = cfg.get("training", {}).get("soft_confidence_range", [0.025, 0.035])
     soft_weight_val = cfg.get("training", {}).get("soft_confidence_weight", 0.1)
-    
-    fuzzy_mask = (delta_z >= soft_range[0]) & (delta_z <= soft_range[1])
-    soft_weight_tensor = torch.ones_like(target_pseudo)
-    soft_weight_tensor[fuzzy_mask] = soft_weight_val
-    
-    loss_phys = loss_phys * soft_weight_tensor
-    loss_geom = loss_geom * soft_weight_tensor
+    fuzzy_mask      = (delta_z >= soft_range[0]) & (delta_z <= soft_range[1])
+    soft_w          = torch.ones_like(target_pseudo)
+    soft_w[fuzzy_mask] = soft_weight_val
+    loss_phys = loss_phys * soft_w
+    loss_geom = loss_geom * soft_w
 
-    # 【重要】如果当前帧有 GT，强迫视觉专家向真实的 GT 学习！
-    has_gt_expanded = has_gt.unsqueeze(1).expand_as(target_gt)
-    active_target_2d = torch.where(has_gt_expanded > 0.5, target_gt, target_pseudo)
-    loss_tex = loss_func(internals["pred_tex"], active_target_2d)
-
+    # 致盲训练
     if is_blind:
-        loss_tex = loss_tex * 0.0
-        loss_phys = loss_phys * 2.0
-        loss_geom = loss_geom * 2.0
+        loss_tex    = loss_tex    * 0.0
+        loss_phys   = loss_phys   * 2.0
+        loss_geom   = loss_geom   * 2.0
 
-    target_fusion = torch.max(target_pseudo, active_target_2d)
-    loss_fusion = loss_func(final_logit, target_fusion)
+    # ④ 噪声帧重加权：has_gt=0 的帧整体降权
+    # has_gt: [B]，扩展到 [B, 63] 与 loss 形状对齐
+    frame_w = torch.where(
+        has_gt.unsqueeze(1).expand_as(target_gt) > 0.5,
+        torch.ones_like(target_gt),
+        torch.full_like(target_gt, pseudo_frame_w)
+    )   # [B, 63]
 
-    total_raw_loss = loss_fusion + 0.4 * loss_phys + 0.4 * loss_geom + 0.4 * loss_tex
+    total_raw_loss = (
+        loss_fusion
+        + expert_w * (loss_phys + loss_geom + loss_tex)
+    ) * frame_w   # 按帧加权
+
     masked_total_loss = total_raw_loss * valid_mask
-    num_valid = valid_mask.sum()
+    num_valid         = valid_mask.sum()
 
     if num_valid > 0:
-        final_loss = masked_total_loss.sum() / num_valid
-        weights = internals["weights"]
+        final_loss  = masked_total_loss.sum() / num_valid
+        weights     = internals["weights"]
         avg_weights = (weights * valid_mask.unsqueeze(-1)).sum(dim=(0, 1)) / num_valid
-        loss_dict = {
-            "Total": final_loss.item(),
+        loss_dict   = {
+            "Total":  final_loss.item(),
             "w_phys": avg_weights[0].item(),
             "w_geom": avg_weights[1].item(),
-            "w_tex": avg_weights[2].item(),
+            "w_tex":  avg_weights[2].item(),
         }
     else:
         final_loss = masked_total_loss.sum() * 0.0
-        loss_dict = {"Total": 0.0, "w_phys": 0.0, "w_geom": 0.0, "w_tex": 0.0}
+        loss_dict  = {"Total": 0.0, "w_phys": 0.0, "w_geom": 0.0, "w_tex": 0.0}
 
     return final_loss, loss_dict
 
@@ -262,30 +305,59 @@ def main():
     blind_start = cfg.get("training", {}).get("blind_prob_start", 0.2)
     blind_end = cfg.get("training", {}).get("blind_prob_end", 0.4)
 
-    npz_dir = Path(cfg["paths"]["output_dir"])
-    img_dir = Path(cfg["paths"]["raw_img_dir"])
-    
-    # 解析 JSON 绝对路径
-    raw_json_path = cfg["paths"].get("manual_label_path", "./data/merged_visual_gt.json")
-    if raw_json_path.startswith("./"):
-        raw_json_path = raw_json_path[2:]
-    json_gt_path = project_root / raw_json_path
-    
-    ckpt_dir = project_root / "pretrained_models"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    save_path = ckpt_dir / "road_mome_v9_e2e_best.pth"
+    seed         = cfg.get("training", {}).get("seed", 42)
+    val_split    = cfg.get("training", {}).get("val_split", 0.15)
+    val_workers  = cfg.get("training", {}).get("val_num_workers", 4)
 
+    # ====================================================
+    # 【核心修复区】：绝对路径锚定机制
+    # 彻底免疫终端 CWD (Current Working Directory) 错误
+    # ====================================================
+    def get_abs_path(p_str):
+        p_str = str(p_str)
+        if p_str.startswith("./"):
+            return project_root / p_str[2:]
+        if Path(p_str).is_absolute():
+            return Path(p_str)
+        return project_root / p_str
+
+    npz_dir      = get_abs_path(cfg["paths"]["output_dir"])
+    img_dir      = get_abs_path(cfg["paths"]["raw_img_dir"])
+    json_gt_path = get_abs_path(cfg["paths"].get("manual_label_path", "./data/merged_visual_gt.json"))
+    # ====================================================
+
+    ckpt_dir  = project_root / "pretrained_models"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    save_path = ckpt_dir / "road_mome_v14_best.pth"
     writer = None
     if cfg.get("train", {}).get("use_tensorboard", True):
         log_dir = project_root / "logs" / "mome_e2e_training"
-        writer = SummaryWriter(log_dir=str(log_dir))
+        writer  = SummaryWriter(log_dir=str(log_dir))
         print(f"📈 TensorBoard 已启动，可用命令查看: tensorboard --logdir={log_dir}")
 
-    # 严密的数据集挂载 (会自动触发异常检测)
-    dataset = E2EDataset(npz_dir, img_dir, json_gt_path)
-    dataloader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, 
-        num_workers=8, pin_memory=True, persistent_workers=True      
+    # --------------------------------------------------
+    # 【v12.0 核心修复】训练 / 验证集正式分离
+    # val_split 配置项从"死配置"变为真正生效的划分逻辑
+    # 使用固定 seed 保证每次运行划分结果一致
+    # --------------------------------------------------
+    full_dataset = E2EDataset(npz_dir, img_dir, json_gt_path)
+    n_total  = len(full_dataset)
+    n_val    = int(n_total * val_split)
+    n_train  = n_total - n_val
+
+    generator = torch.Generator().manual_seed(seed)
+    train_dataset, val_dataset = random_split(
+        full_dataset, [n_train, n_val], generator=generator
+    )
+    print(f"📂 数据集划分 → 训练: {n_train} 帧 | 验证: {n_val} 帧 (val_split={val_split})")
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=8, pin_memory=True, persistent_workers=True
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=val_workers, pin_memory=True, persistent_workers=True
     )
 
     dim_phys = cfg["features"]["phys"]["input_dim"]
@@ -309,20 +381,31 @@ def main():
         {'params': base_params, 'lr': lr_base},
         {'params': live_2d_params, 'lr': lr_2d}
     ])
-    
+
+    # ⑤ CosineAnnealingLR：全程余弦退火，eta_min 为初始 lr 的 1/20
+    # 让模型在后期 epoch 精细收敛，缓解 v12 Epoch 69 后的震荡下滑
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=epochs,
+        eta_min=lr_base / 20
+    )
+
     scaler = torch.amp.GradScaler(device='cuda', enabled=cfg.get("training", {}).get("amp_enabled", True))
 
     best_f1 = 0.0
 
-    print(f"🚀 强制对齐训练马拉松启动 | BS: {batch_size} | Pos Weight: {pos_weight}")
+    print(f"🚀 Road-MoME v14.0 训练启动 | BS: {batch_size} | Pos Weight: {pos_weight} | Train: {n_train} | Val: {n_val}")
 
     for epoch in range(1, epochs + 1):
+        # ================================================
+        # 训练阶段
+        # ================================================
         model.train()
         blind_prob = get_dynamic_blindness_prob(epoch, epochs, blind_start, blind_end)
         epoch_losses = []
         epoch_tp, epoch_fp, epoch_tn, epoch_fn = 0, 0, 0, 0
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [Train]")
         for batch in pbar:
             img_tensor = batch["img_tensor"].to(device, non_blocking=True) 
             raw_rois = batch["rois"].to(device, non_blocking=True)         
@@ -351,7 +434,7 @@ def main():
 
             with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=scaler.is_enabled()):
                 final_logit, internals = model(img_tensor, rois_tensor, f3_stats, f3_mae, q_2d, valid_mask)
-                loss, loss_dict = mome_loss_v9_5(
+                loss, loss_dict = mome_loss_v14(
                     final_logit, internals, f3_stats, pseudo_label, target_gt,
                     valid_mask, has_gt, pos_weight, is_blind, cfg
                 )
@@ -368,15 +451,14 @@ def main():
             with torch.no_grad():
                 probs = torch.sigmoid(final_logit)
                 preds = (probs > 0.5).float()
-                
-                has_gt_expanded = has_gt.unsqueeze(1).expand_as(target_gt)
-                active_target_2d = torch.where(has_gt_expanded > 0.5, target_gt, pseudo_label)
-                target_fusion = torch.max(pseudo_label, active_target_2d)
-                
+
+                # 综合指标口径：两类目标取 OR，与推理行为一致
+                target_fusion = torch.max(pseudo_label, target_gt)
+
                 valid_idx = valid_mask > 0.5
                 p_v = preds[valid_idx]
                 t_v = target_fusion[valid_idx]
-                
+
                 epoch_tp += ((p_v == 1) & (t_v == 1)).sum().item()
                 epoch_fp += ((p_v == 1) & (t_v == 0)).sum().item()
                 epoch_tn += ((p_v == 0) & (t_v == 0)).sum().item()
@@ -384,40 +466,104 @@ def main():
 
             pbar.set_postfix({"Loss": f"{loss_dict['Total']:.3f}"})
 
-        avg_loss = np.mean([d["Total"] for d in epoch_losses])
+        avg_loss   = np.mean([d["Total"]  for d in epoch_losses])
         avg_w_phys = np.mean([d["w_phys"] for d in epoch_losses])
         avg_w_geom = np.mean([d["w_geom"] for d in epoch_losses])
-        avg_w_tex = np.mean([d["w_tex"] for d in epoch_losses])
-        
-        acc = (epoch_tp + epoch_tn) / (epoch_tp + epoch_tn + epoch_fp + epoch_fn + 1e-6)
-        precision = epoch_tp / (epoch_tp + epoch_fp + 1e-6)
-        recall = epoch_tp / (epoch_tp + epoch_fn + 1e-6)
-        f1 = 2 * precision * recall / (precision + recall + 1e-6)
-        
+        avg_w_tex  = np.mean([d["w_tex"]  for d in epoch_losses])
+
+        train_acc       = (epoch_tp + epoch_tn) / (epoch_tp + epoch_tn + epoch_fp + epoch_fn + 1e-6)
+        train_precision = epoch_tp / (epoch_tp + epoch_fp + 1e-6)
+        train_recall    = epoch_tp / (epoch_tp + epoch_fn + 1e-6)
+        train_f1        = 2 * train_precision * train_recall / (train_precision + train_recall + 1e-6)
+
         print(f"\n📊 [诊断报告] Epoch {epoch}")
-        print(f"   ┣ 专家决策权重 -> Phys: {avg_w_phys:.2f} | Geom(3D): {avg_w_geom:.2f} | Tex(2D): {avg_w_tex:.2f}")
-        print(f"   ┗ 病害识别指标 -> Accuracy: {acc*100:.1f}% | Precision: {precision*100:.1f}% | Recall: {recall*100:.1f}% | 🏆 F1-Score: {f1:.4f}")
+        print(f"   ┣ 专家决策权重  -> Phys: {avg_w_phys:.2f} | Geom(3D): {avg_w_geom:.2f} | Tex(2D): {avg_w_tex:.2f}")
+        print(f"   ┣ [训练集] Acc: {train_acc*100:.1f}% | Prec: {train_precision*100:.1f}% | Rec: {train_recall*100:.1f}% | F1: {train_f1:.4f}")
+
+        # ================================================
+        # 【v12.0 核心修复】验证阶段
+        # model.eval() + no_grad()，在验证集上独立评估
+        # ================================================
+        model.eval()
+        val_tp, val_fp, val_tn, val_fn = 0, 0, 0, 0
+
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch}/{epochs} [Val]", leave=False):
+                img_tensor   = batch["img_tensor"].to(device, non_blocking=True)
+                raw_rois     = batch["rois"].to(device, non_blocking=True)
+                f3_stats     = batch["f3_stats"].to(device, non_blocking=True)
+                f3_mae       = batch["f3_mae"].to(device, non_blocking=True)
+                q_2d         = batch["q_2d"].to(device, non_blocking=True)
+                pseudo_label = batch["pseudo_label"].to(device, non_blocking=True)
+                target_gt    = batch["target_gt"].to(device, non_blocking=True)
+                valid_mask   = batch["valid_mask"].to(device, non_blocking=True)
+                has_gt       = batch["has_gt"].to(device, non_blocking=True)
+
+                B = img_tensor.size(0)
+                batch_rois_list = []
+                for b_idx in range(B):
+                    b_idx_tensor = torch.full((63, 1), b_idx, dtype=torch.float32, device=device)
+                    batch_rois_list.append(torch.cat([b_idx_tensor, raw_rois[b_idx]], dim=1))
+                rois_tensor = torch.cat(batch_rois_list, dim=0)
+
+                final_logit, _ = model(
+                    img_tensor, rois_tensor, f3_stats, f3_mae, q_2d, valid_mask
+                )
+
+                probs = torch.sigmoid(final_logit)
+                preds = (probs > 0.5).float()
+
+                # 综合指标口径：两类目标取 OR，与推理行为一致
+                target_fusion = torch.max(pseudo_label, target_gt)
+
+                valid_idx = valid_mask > 0.5
+                p_v = preds[valid_idx]
+                t_v = target_fusion[valid_idx]
+
+                val_tp += ((p_v == 1) & (t_v == 1)).sum().item()
+                val_fp += ((p_v == 1) & (t_v == 0)).sum().item()
+                val_tn += ((p_v == 0) & (t_v == 0)).sum().item()
+                val_fn += ((p_v == 0) & (t_v == 1)).sum().item()
+
+        val_precision = val_tp / (val_tp + val_fp + 1e-6)
+        val_recall    = val_tp / (val_tp + val_fn + 1e-6)
+        val_f1        = 2 * val_precision * val_recall / (val_precision + val_recall + 1e-6)
+        val_acc       = (val_tp + val_tn) / (val_tp + val_tn + val_fp + val_fn + 1e-6)
+
+        print(f"   ┗ [验证集] Acc: {val_acc*100:.1f}% | Prec: {val_precision*100:.1f}% | Rec: {val_recall*100:.1f}% | 🏆 F1: {val_f1:.4f}")
 
         if writer:
-            writer.add_scalar("Train/Loss", avg_loss, epoch)
-            writer.add_scalar("Metrics/F1-Score", f1, epoch)
-            writer.add_scalar("Metrics/Precision", precision, epoch)
-            writer.add_scalar("Metrics/Recall", recall, epoch)
-            writer.add_scalar("ExpertWeight/Phys", avg_w_phys, epoch)
-            writer.add_scalar("ExpertWeight/Geom_3D", avg_w_geom, epoch)
-            writer.add_scalar("ExpertWeight/Tex_2D", avg_w_tex, epoch)
+            writer.add_scalar("Train/Loss",           avg_loss,        epoch)
+            writer.add_scalar("Train/F1",             train_f1,        epoch)
+            writer.add_scalar("Train/Precision",      train_precision, epoch)
+            writer.add_scalar("Train/Recall",         train_recall,    epoch)
+            writer.add_scalar("Val/F1",               val_f1,          epoch)
+            writer.add_scalar("Val/Precision",        val_precision,   epoch)
+            writer.add_scalar("Val/Recall",           val_recall,      epoch)
+            writer.add_scalar("Val/Accuracy",         val_acc,         epoch)
+            writer.add_scalar("ExpertWeight/Phys",    avg_w_phys,      epoch)
+            writer.add_scalar("ExpertWeight/Geom_3D", avg_w_geom,      epoch)
+            writer.add_scalar("ExpertWeight/Tex_2D",  avg_w_tex,       epoch)
+            writer.add_scalar("Train/LR_base",
+                              scheduler.get_last_lr()[0], epoch)
 
-        if f1 > best_f1:
-            best_f1 = f1
+        # ⑤ LR Scheduler step（验证之后执行）
+        scheduler.step()
+
+        if val_f1 > best_f1:
+            best_f1 = val_f1
             torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
+                'epoch':                epoch,
+                'model_state_dict':     model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'best_f1': best_f1,
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_val_f1':          best_f1,
+                'train_f1':             train_f1,
+                'version':              'v14.0',
             }, save_path)
-            print(f"   💾 [Weight Saved] 突破历史最高 F1 ({best_f1:.4f})! 权重已保存在: {save_path.name}\n")
+            print(f"   💾 [Weight Saved] 验证集 F1 突破历史最高 ({best_f1:.4f})! 权重已保存: {save_path.name}\n")
         else:
-            print(f"   - (未突破最佳 F1: {best_f1:.4f})\n")
+            print(f"   - (未突破最佳验证 F1: {best_f1:.4f})\n")
 
     if writer:
         writer.close()

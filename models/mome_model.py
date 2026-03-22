@@ -1,175 +1,385 @@
 """
-Road-MoME 端到端多模态混合专家模型 (v9.5 E2E Cloud 版)
+Road-MoME 核心模型架构 (v14.0)
 
-核心重构：
-1. 活体视觉接入 (Live 2D Extractor)：内嵌 ConvNeXt-Base，废弃外部离线 .npz 视觉特征输入。
-2. 动态 ROI Align：在 GPU 显存中实时将全局特征图切割为 63 个 Patch。
-3. 梯度精细管控：冻结 ConvNeXt 的前 3 个 Stage (防过拟合与加速)，仅放开 Stage 2 (features.3) 参与微调。
+差异化专家（v12.0）保持不变：
+- PhysExpert   : 窄 MLP + LayerNorm + 软单调性约束
+- GeomExpert   : 残差 MLP + 邻域深度对比特征
+- TexExpert    : Patch 间 Self-Attention + valid_mask key_padding_mask
+
+v14.0 新增 — CrossModalAttention padding mask（修复已知 bug）：
+    盲区 patch 的 f3_mae 为无效点云，原来仍作为 Key/Value 参与 softmax，
+    零向量的 attention score 平均分摊了概率质量，稀释有效 patch 的注意力能量。
+    修复：将 valid_mask==0 的位置设为 key_padding_mask=True，
+    使盲区 Key 被 MultiheadAttention 完全忽略，有效 patch 注意力集中。
+
+专家升级策略：
+- Level 1：结构差异化
+    * PhysExpert   : 窄 MLP + LayerNorm
+    * GeomExpert   : 残差 MLP + LayerNorm
+    * TexExpert    : Patch 间 Self-Attention + MLP
+
+- Level 2：任务感知差异化
+    * PhysExpert   : 非负权重单调性约束
+    * GeomExpert   : 邻域深度对比特征
+    * TexExpert    : valid_mask 注入 Attention key_padding_mask
+
+v13.1 修复（保留）— 统一监督单头：
+    回退 v13.0 双头设计，回归单输出头。
+
+v13.2 修复（保留）— 分层监督：
+    loss_tex 回归 target_gt，Tex 专家保留干净视觉监督信号。
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.models import convnext_base, ConvNeXt_Base_Weights
 from torchvision.models.feature_extraction import create_feature_extractor
 from torchvision.ops import roi_align
 
 
 # ==========================================
-# 1. 局部窗口注意力层 (保留物理空间连续性)
+# 1. 跨模态交叉注意力模块（保持不变）
 # ==========================================
-class LocalWindowAttention(nn.Module):
-    def __init__(self, dim=1024, num_heads=8):
+class CrossModalAttention(nn.Module):
+    def __init__(self, dim_2d=1024, dim_3d=384, d_model=256, num_heads=8):
         super().__init__()
-        self.attn = nn.MultiheadAttention(
-            embed_dim=dim, num_heads=num_heads, batch_first=True
-        )
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
+        self.q_proj = nn.Linear(dim_2d, d_model)
+        self.k_proj = nn.Linear(dim_3d, d_model)
+        self.v_proj = nn.Linear(dim_3d, d_model)
+
+        self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+
         self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model * 2, d_model),
         )
-        self.register_buffer("attn_mask", self._create_local_mask())
+        self.norm2 = nn.LayerNorm(d_model)
+        self.out_proj = nn.Linear(d_model, dim_2d)
 
-    def _create_local_mask(self):
-        mask = torch.full((63, 63), float("-inf"))
-        for i in range(63):
-            r1, c1 = divmod(i, 7)
-            for j in range(63):
-                r2, c2 = divmod(j, 7)
-                if abs(r1 - r2) <= 1 and abs(c1 - c2) <= 1:
-                    mask[i, j] = 0.0
-        return mask
+    def forward(self, f2_tex, f3_mae, valid_mask=None):
+        """
+        f2_tex     : [B, 63, dim_2d]
+        f3_mae     : [B, 63, dim_3d]
+        valid_mask : [B, 63]  1=有效 0=盲区（可选）
 
-    def forward(self, x):
-        attn_out, _ = self.attn(x, x, x, attn_mask=self.attn_mask)
-        x = self.norm1(x + attn_out)
-        ffn_out = self.ffn(x)
-        x = self.norm2(x + ffn_out)
-        return x
+        ③ Attention padding mask（v14.0 修复）：
+        盲区 patch 的 f3_mae 为无效点云，不应作为 Key/Value 参与 softmax。
+        将盲区位置设为 True 传入 key_padding_mask，使其被完全忽略，
+        有效 patch 的注意力能量不再被盲区稀释。
+        """
+        q = self.q_proj(f2_tex)
+        k = self.k_proj(f3_mae)
+        v = self.v_proj(f3_mae)
+
+        # 构造 key_padding_mask：盲区位置为 True（被 MHA 忽略）
+        key_padding_mask = None
+        if valid_mask is not None:
+            key_padding_mask = (valid_mask == 0)   # [B, 63]
+
+        attn_out, _ = self.attn(q, k, v, key_padding_mask=key_padding_mask)
+        x = self.norm1(q + attn_out)
+        x = self.norm2(x + self.ffn(x))
+
+        # 残差防火墙：3D 情报以增量方式叠加，不覆盖原始 2D 特征
+        f2_enhanced = f2_tex + self.out_proj(x)
+        return f2_enhanced
 
 
 # ==========================================
-# 2. 活体 2D 特征提取器 (E2E 核心组件)
+# 2. 差异化专家模块（v12.0 核心升级）
 # ==========================================
-class Live2DExtractor(nn.Module):
-    def __init__(self):
+
+class PhysExpert(nn.Module):
+    """
+    物理统计专家（Level 1 + Level 2）
+
+    Level 1 结构差异化：
+      - 窄 MLP (8→64→32→1)，容量与 8 维输入匹配
+      - LayerNorm 替换 BatchNorm，消除小 batch 下统计量不稳定问题
+
+    Level 2 任务感知差异化：
+      - 使用 weight 绝对值 + Softplus 激活实现软单调性约束
+      - 物理统计量（粗糙度/坡度/反射率方差）与病害概率理论单调相关
+      - 软约束：梯度更新中非负方向受到鼓励，但不做硬截断
+    """
+
+    def __init__(self, input_dim: int = 8, dropout: float = 0.2):
         super().__init__()
-        # 依托 RTX 5090 算力，直接使用 ConvNeXt-Base
-        base_model = convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT)
-        # 截取 features.3 (即 Stage 2), 具有 Stride=8 的高分辨率，输出通道 256
-        self.backbone = create_feature_extractor(
-            base_model, return_nodes={"features.3": "feat"}
+        self.fc1 = nn.Linear(input_dim, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 1)
+        self.norm1 = nn.LayerNorm(64)
+        self.norm2 = nn.LayerNorm(32)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [N, 8]  (N = B * 63，展平格式)"""
+        # 非负权重：abs() 实现软单调约束
+        h = F.linear(x, torch.abs(self.fc1.weight), self.fc1.bias)
+        h = self.drop(F.softplus(self.norm1(h)))          # Softplus 是单调激活
+
+        h = F.linear(h, torch.abs(self.fc2.weight), self.fc2.bias)
+        h = F.softplus(self.norm2(h))
+
+        return self.fc3(h)                                 # [N, 1]
+
+
+class GeomExpert(nn.Module):
+    """
+    几何深度专家（Level 1 + Level 2）
+
+    Level 1 结构差异化：
+      - 残差 MLP：主路径 fc1→fc2，捷径 shortcut 直接从输入跨两层
+      - LayerNorm 替换 BatchNorm
+
+    Level 2 任务感知差异化：
+      - 邻域深度对比特征：计算每个 patch 与本帧全局均值的差分
+      - 坑洞 = 局部深度突变，差分特征显式捕捉这种异常
+      - forward 接收序列格式 [B, 63, 384]，内部展平后处理
+    """
+
+    def __init__(self, input_dim: int = 384, hidden_dim: int = 256, dropout: float = 0.3):
+        super().__init__()
+        # 拼接原始特征 + 对比特征后的输入维度
+        contrast_dim = 64
+        aug_dim = input_dim + contrast_dim
+
+        # 对比特征编码器
+        self.contrast_proj = nn.Sequential(
+            nn.Linear(input_dim, contrast_dim),
+            nn.LayerNorm(contrast_dim),
+            nn.GELU(),
         )
 
-        # 【梯度管控策略】
-        # 冻结浅层特征，仅让 features.3 参与反向传播，避免小数据集破坏 ImageNet 预训练泛化能力
-        for name, param in self.backbone.named_parameters():
-            if not name.startswith("features.3"):
-                param.requires_grad = False
+        # 主路径
+        self.fc1 = nn.Linear(aug_dim, hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.norm2 = nn.LayerNorm(hidden_dim // 2)
+        self.fc3 = nn.Linear(hidden_dim // 2, 1)
+        self.drop = nn.Dropout(dropout)
 
-    def forward(self, img_tensor, rois):
-        """
-        img_tensor: [B, 3, 560, 1008]
-        rois: [B*63, 5] 格式为 (batch_idx, x_min, y_min, x_max, y_max)
-        """
-        # [B, 256, H/8, W/8]
-        spatial_feat = self.backbone(img_tensor)["feat"]
+        # 残差捷径：跨越 fc1+fc2，梯度可以直接从 fc3 回传到输入
+        self.shortcut = nn.Linear(aug_dim, hidden_dim // 2)
 
-        # 动态 ROI Align (对齐 Stride=8)
-        # 输出尺寸设为 2x2，保持空间纹理结构
-        pooled_feat = roi_align(
-            spatial_feat, rois, output_size=(2, 2), spatial_scale=1 / 8.0
+    def forward(self, x_seq: torch.Tensor) -> torch.Tensor:
+        """
+        x_seq: [B, 63, 384]  ← 注意：序列格式，不是展平格式
+        返回:  [B*63, 1]     ← 与旧接口一致，Engine 中 view 还原即可
+        """
+        B, N, D = x_seq.shape
+
+        # Level 2：计算邻域对比特征
+        # 每个 patch 与本帧所有 patch 均值的差 → 捕捉局部深度异常
+        mean_feat = x_seq.mean(dim=1, keepdim=True)        # [B, 1, 384]
+        contrast = x_seq - mean_feat                        # [B, 63, 384]
+        contrast_enc = self.contrast_proj(contrast)         # [B, 63, 64]
+
+        # 拼接原始特征 + 对比特征
+        x_aug = torch.cat([x_seq, contrast_enc], dim=-1)   # [B, 63, 448]
+        x_flat = x_aug.view(B * N, -1)                      # [B*63, 448]
+
+        # 主路径
+        h = self.drop(F.gelu(self.norm1(self.fc1(x_flat))))
+        h = self.norm2(self.fc2(h))
+
+        # 残差捷径 + 激活
+        h = F.gelu(h + self.shortcut(x_flat))
+
+        return self.fc3(h)                                  # [B*63, 1]
+
+
+class TexExpert(nn.Module):
+    """
+    视觉纹理专家（Level 1 + Level 2）
+
+    Level 1 结构差异化：
+      - 先降维投影 (1024→hidden_dim)，减少 Attention 计算量
+      - Patch 间 Self-Attention：63 个 patch 作为序列，互相参考视觉状态
+      - 残差连接保留原始特征
+      - LayerNorm 替换 BatchNorm
+
+    Level 2 任务感知差异化：
+      - valid_mask 注入 MultiheadAttention 的 key_padding_mask
+      - 盲区 patch 不作为 key/value 参与其他 patch 的注意力计算
+      - 裂缝（跨 patch 连续结构）和坑洞（局部凹陷）均可从空间关系中获益
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 1024,
+        hidden_dim: int = 256,
+        num_heads: int = 4,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+
+        # Step 1：降维，1024 → hidden_dim
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
         )
 
-        # 展平: [B*63, 256, 2, 2] -> [B*63, 1024]
-        flat_feat = pooled_feat.view(pooled_feat.size(0), -1)
+        # Step 2：Patch 间 Self-Attention（序列长度 = 63）
+        self.patch_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attn_norm = nn.LayerNorm(hidden_dim)
 
-        # 恢复 [B, 63, 1024] 的形状以对接后续时序/空间网络
-        B = img_tensor.shape[0]
-        return flat_feat.view(B, 63, 1024)
+        # Step 3：逐 patch 分类头
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(
+        self, x: torch.Tensor, valid_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        x          : [B, 63, 1024]  ← 序列格式
+        valid_mask : [B, 63]        ← 1=有效，0=盲区（可选）
+        返回       : [B*63, 1]      ← 与旧接口一致
+        """
+        B, N, _ = x.shape
+
+        # Step 1：降维投影
+        h = self.input_proj(x)                             # [B, 63, hidden_dim]
+
+        # Step 2：构造 key_padding_mask（Level 2 核心）
+        # MultiheadAttention 约定：True = 该位置被忽略（屏蔽）
+        key_padding_mask = None
+        if valid_mask is not None:
+            key_padding_mask = (valid_mask == 0)           # [B, 63]，盲区为 True
+
+        # Self-Attention + 残差
+        attn_out, _ = self.patch_attn(
+            h, h, h, key_padding_mask=key_padding_mask
+        )
+        h = self.attn_norm(h + attn_out)                   # [B, 63, hidden_dim]
+
+        # Step 3：逐 patch 输出
+        out = self.head(h.view(B * N, -1))                 # [B*63, 1]
+        return out
 
 
 # ==========================================
-# 3. 质量感知动态门控 (MoE 决策枢纽)
+# 3. 质量感知动态门控网络（保持不变）
 # ==========================================
 class MoMEGatingNetwork(nn.Module):
-    def __init__(self, dim_f3_stats=8, dim_f3_mae=384, dim_f2_conv=1024):
+    def __init__(self, dim_f3_stats=8, dim_f3_mae=384, dim_f2=1024):
         super().__init__()
         self.quality_proj = nn.Sequential(
             nn.Linear(1, 16), nn.ReLU(), nn.Linear(16, 32)
         )
-        concat_dim = dim_f3_stats + dim_f3_mae + dim_f2_conv + 32
+        concat_dim = dim_f3_stats + dim_f3_mae + dim_f2 + 32
 
         self.gate = nn.Sequential(
             nn.Linear(concat_dim, 256),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(256, 3),  # 对应 Phys, Geom, Tex 三个专家
+            nn.Linear(256, 3),
             nn.Softmax(dim=-1),
         )
 
-    def forward(self, f3_stats, f3_mae, f2_conv, quality_2d):
+    def forward(self, f3_stats, f3_mae, f2, quality_2d):
         q_feat = self.quality_proj(quality_2d)
-        combined_feat = torch.cat([f3_stats, f3_mae, f2_conv, q_feat], dim=-1)
-        return self.gate(combined_feat), combined_feat
+        combined_feat = torch.cat([f3_stats, f3_mae, f2, q_feat], dim=-1)
+        return self.gate(combined_feat)
 
 
 # ==========================================
-# 4. Road-MoME 主引擎 (Engine)
+# 4. Road-MoME 主引擎（v13.1 统一监督单头）
 # ==========================================
 class MoMEEngine(nn.Module):
-    def __init__(self, dim_f3_stats=8, dim_f3_mae=384):
+    def __init__(self, dim_f3_stats=8, dim_f3_mae=384, hidden_dim=256):
         super().__init__()
 
-        # 活体 2D 骨干网络 (输出 1024 维)
-        self.live_2d = Live2DExtractor()
-        dim_f2_conv = 1024
-
-        self.f2_local_attn = LocalWindowAttention(dim=dim_f2_conv)
-
-        # 专家网络池
-        self.exp_phys = nn.Sequential(
-            nn.Linear(dim_f3_stats, 32), nn.ReLU(), nn.Linear(32, 1)
+        # --- 1. 活体 2D 提取器（不变） ---
+        base_model = convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT)
+        self.live_2d_backbone = create_feature_extractor(
+            base_model, return_nodes={"features.3": "feat"}
         )
-        self.exp_geom = nn.Sequential(
-            nn.Linear(dim_f3_mae, 128), nn.ReLU(), nn.Linear(128, 1)
-        )
-        self.exp_tex = nn.Sequential(
-            nn.Linear(dim_f2_conv, 256),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 1),
+        for name, param in self.live_2d_backbone.named_parameters():
+            if not name.startswith("features.3"):
+                param.requires_grad = False
+        self.dim_f2 = 1024
+
+        # --- 2. 跨模态注意力（不变） ---
+        self.cross_modal_attn = CrossModalAttention(
+            dim_2d=self.dim_f2, dim_3d=dim_f3_mae, d_model=256, num_heads=8
         )
 
-        self.gating = MoMEGatingNetwork(dim_f3_stats, dim_f3_mae, dim_f2_conv)
+        # --- 3. 差异化专家池（v12.0，不变） ---
+        self.expert_phys = PhysExpert(input_dim=dim_f3_stats)
+        self.expert_geom = GeomExpert(input_dim=dim_f3_mae, hidden_dim=hidden_dim)
+        self.expert_tex  = TexExpert(input_dim=self.dim_f2, hidden_dim=hidden_dim)
 
-    def forward(self, img_tensor, rois, f3_stats, f3_mae, quality_2d, valid_mask):
-        # 1. 活体视觉流提取 (E2E)
-        f2_live = self.live_2d(img_tensor, rois)  # [B, 63, 1024]
+        # --- 4. 门控网络（不变） ---
+        self.gating = MoMEGatingNetwork(dim_f3_stats, dim_f3_mae, self.dim_f2)
 
-        # 物理盲区强制清零，防止无关区域干扰视觉特征
-        f2_live = f2_live * valid_mask.unsqueeze(-1)
+    def forward(self, img_tensor, rois_tensor, f3_stats, f3_mae, q_2d, valid_mask):
+        B = img_tensor.size(0)
+        num_patches = 63
 
-        # 空间注意力强化
-        f2_conv_enhanced = self.f2_local_attn(f2_live)
+        # --------------------------------------------------
+        # Phase 1：视觉活体流处理（不变）
+        # --------------------------------------------------
+        spatial_feat = self.live_2d_backbone(img_tensor)["feat"]
+        pooled_feat = roi_align(
+            spatial_feat, rois_tensor, output_size=(2, 2), spatial_scale=1 / 8.0
+        )
+        # [B*63, C, 2, 2] → [B, 63, dim_f2]
+        f2_tex = pooled_feat.view(pooled_feat.size(0), -1).view(B, num_patches, self.dim_f2)
+        f2_tex = f2_tex * valid_mask.unsqueeze(-1)
 
-        # 2. 三专家独立前向传播
-        pred_phys = self.exp_phys(f3_stats)
-        pred_geom = self.exp_geom(f3_mae)
-        pred_tex = self.exp_tex(f2_conv_enhanced)
+        # --------------------------------------------------
+        # Phase 2：跨模态深度交互（v14.0：传入 valid_mask 屏蔽盲区 key）
+        # --------------------------------------------------
+        f2_enhanced = self.cross_modal_attn(f2_tex, f3_mae, valid_mask)
+        f2_enhanced = f2_enhanced * valid_mask.unsqueeze(-1)
 
-        # 3. 门控网络分配投票权
-        weights, _ = self.gating(f3_stats, f3_mae, f2_conv_enhanced, quality_2d)
+        # --------------------------------------------------
+        # Phase 3：差异化专家独立诊断
+        # --------------------------------------------------
+        # Phys：展平输入，输出 [B*63, 1]
+        pred_phys_flat = self.expert_phys(
+            f3_stats.view(B * num_patches, -1)
+        )
 
-        # 4. 融合决策
-        preds_stacked = torch.cat([pred_phys, pred_geom, pred_tex], dim=-1)
-        final_logit = torch.sum(preds_stacked * weights, dim=-1, keepdim=True)
+        # Geom：序列输入 [B, 63, 384]，内部计算对比特征后展平输出
+        pred_geom_flat = self.expert_geom(f3_mae)
+
+        # Tex：序列输入 [B, 63, dim_f2]，传入 valid_mask 屏蔽盲区 patch
+        pred_tex_flat = self.expert_tex(f2_enhanced, valid_mask)
+
+        pred_phys = pred_phys_flat.view(B, num_patches)
+        pred_geom = pred_geom_flat.view(B, num_patches)
+        pred_tex  = pred_tex_flat.view(B, num_patches)
+
+        # --------------------------------------------------
+        # Phase 4：决策级动态融合（v13.1 回归单头）
+        # --------------------------------------------------
+        weights = self.gating(f3_stats, f3_mae, f2_enhanced, q_2d)
+
+        expert_preds = torch.stack([pred_phys, pred_geom, pred_tex], dim=-1)
+        final_logit  = (expert_preds * weights).sum(dim=-1)   # [B, 63]
 
         internals = {
-            "pred_phys": pred_phys.squeeze(-1),
-            "pred_geom": pred_geom.squeeze(-1),
-            "pred_tex": pred_tex.squeeze(-1),
-            "weights": weights,
+            "pred_phys": pred_phys,
+            "pred_geom": pred_geom,
+            "pred_tex":  pred_tex,
+            "weights":   weights,
         }
 
-        return final_logit.squeeze(-1), internals
+        return final_logit, internals
