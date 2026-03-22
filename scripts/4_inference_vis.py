@@ -1,13 +1,24 @@
 """
-Road-MoME 推理与可视化引擎 (v10.6 精准索引与绝对路径锚定版)
+Road-MoME 推理与可视化引擎 (v11.0 答辩展示版)
 
-核心重构：
-1. 索引制导加载：彻底废弃 rglob 盲搜，优先读取 dataset_index 标准索引，确保图像路径 100% 精准。
-2. 绝对路径锚定：引入 get_abs_path 机制，免疫终端 CWD (当前工作目录) 错位导致的文件找不到问题。
-3. 动态路径挂载: 修复 JSON 真值路径硬编码，完美接入 config.yaml，渲染对比图更严谨。
+布局：2×2 等大四格 + 顶部信息栏
+  ┌──────────────────┬──────────────────┐
+  │  Frame ID | Phys:x.xx Geom:x.xx Tex:x.xx | Valid:xx/63  │  顶部信息栏
+  ├──────────────────┬──────────────────┤
+  │  预测概率热力图   │  Phys 权重热力图  │
+  │  INFERNO colormap│  门控权重 w[:,0]  │
+  ├──────────────────┼──────────────────┤
+  │  Geom 权重热力图  │  Tex  权重热力图  │
+  │  门控权重 w[:,1]  │  门控权重 w[:,2]  │
+  └──────────────────┴──────────────────┘
+
+热力图值：
+  - 预测图：sigmoid(final_logit) ∈ [0,1]
+  - 专家图：weights[:,:,i] ∈ [0,1]（门控网络 Softmax 输出，三图之和=1）
+
+透明度：colormap 叠加 alpha=0.55（原图纹理清晰透出），轮廓线 1px
 """
 
-import os
 import sys
 import json
 import yaml
@@ -23,16 +34,24 @@ sys.path.insert(0, str(project_root))
 
 from models.mome_model import MoMEEngine
 
+
+# ─────────────────────────────────────────────
+# 工具函数
+# ─────────────────────────────────────────────
+
 def load_config():
     with open(project_root / "config" / "config.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
 
 img_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
-def generate_rois(patch_corners_uv, valid_mask, orig_w, orig_h, target_w=1008, target_h=560):
+
+def generate_rois(patch_corners_uv, valid_mask, orig_w, orig_h,
+                  target_w=1008, target_h=560):
     rois = []
     scale_x, scale_y = target_w / orig_w, target_h / orig_h
     for i in range(63):
@@ -48,228 +67,315 @@ def generate_rois(patch_corners_uv, valid_mask, orig_w, orig_h, target_w=1008, t
                 rois.append([0.0, 0.0, 1.0, 1.0])
             else:
                 rois.append([float(x_min), float(y_min), float(x_max), float(y_max)])
-    
     rois_tensor = torch.tensor(rois, dtype=torch.float32)
-    batch_idx = torch.zeros((63, 1), dtype=torch.float32)
+    batch_idx   = torch.zeros((63, 1), dtype=torch.float32)
     return torch.cat([batch_idx, rois_tensor], dim=1)
 
-def draw_inference_result(img_bgr, patch_corners_uv, valid_mask, preds, gt_labels, weights, frame_id, out_dir):
+
+def val_to_inferno_bgr(v: float):
     """
-    像素级复刻标注工具的视觉效果 (0.1 Alpha, 1px线宽)
-    同时渲染 Ground Truth (左) 和 Prediction (右) 以便排查对比
+    将 [0,1] 标量映射到 INFERNO colormap，返回 BGR tuple（与 OpenCV 兼容）。
+    手工实现，无需 matplotlib，保证无外部依赖。
+    控制点来自 matplotlib INFERNO 官方色表。
     """
-    h, w = img_bgr.shape[:2]
-    
-    img_gt = img_bgr.copy()
-    img_pred = img_bgr.copy()
-    overlay_gt = img_bgr.copy()
-    overlay_pred = img_bgr.copy()
-    
+    stops_rgb = np.array([
+        [  0,   0,   4],
+        [ 40,  11,  84],
+        [101,  21, 110],
+        [159,  42,  99],
+        [212,  72,  66],
+        [245, 125,  21],
+        [252, 193,  33],
+        [252, 255, 164],
+    ], dtype=np.float32)
+
+    v = float(np.clip(v, 0.0, 1.0))
+    idx = v * (len(stops_rgb) - 1)
+    lo  = int(idx)
+    hi  = min(lo + 1, len(stops_rgb) - 1)
+    frac = idx - lo
+    rgb = stops_rgb[lo] * (1 - frac) + stops_rgb[hi] * frac
+    r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
+    return (b, g, r)   # OpenCV BGR
+
+
+def draw_heatmap_panel(base_img_bgr, patch_corners_uv, valid_mask,
+                       values, title, alpha=0.55):
+    """
+    在 base_img_bgr 上叠加 INFERNO 热力图，返回新图像。
+
+    参数：
+      base_img_bgr   : 原始图像（H, W, 3），BGR
+      patch_corners_uv : (63, 4, 2) patch 角点，原始图像坐标
+      valid_mask     : (63,) float，1=有效
+      values         : (63,) float，热力值 ∈ [0,1]
+      title          : 左上角标题文字
+      alpha          : colormap 叠加透明度（越小越透明，原图越清晰）
+    """
+    img   = base_img_bgr.copy()
+    overlay = base_img_bgr.copy()
+    h, w  = img.shape[:2]
+
     for i in range(63):
-        if valid_mask[i] == 0: continue
-        
+        if valid_mask[i] < 0.5:
+            continue
         corners = patch_corners_uv[i].astype(np.int32)
-        
-        # --- 绘制 Ground Truth ---
-        is_gt_anomaly = gt_labels[i] > 0.5
-        color_gt = (0, 0, 255) if is_gt_anomaly else (0, 255, 0)
-        cv2.fillPoly(overlay_gt, [corners], color_gt)
-        cv2.polylines(img_gt, [corners], isClosed=True, color=color_gt, thickness=1, lineType=cv2.LINE_AA)
-        
-        # --- 绘制 Prediction ---
-        is_pred_anomaly = preds[i] > 0.5
-        color_pred = (0, 0, 255) if is_pred_anomaly else (0, 255, 0)
-        cv2.fillPoly(overlay_pred, [corners], color_pred)
-        cv2.polylines(img_pred, [corners], isClosed=True, color=color_pred, thickness=2, lineType=cv2.LINE_AA)
+        color   = val_to_inferno_bgr(values[i])
 
-    # 弱透明度混合 (10%)
-    cv2.addWeighted(overlay_gt, 0.1, img_gt, 0.9, 0, img_gt)
-    cv2.addWeighted(overlay_pred, 0.1, img_pred, 0.9, 0, img_pred)
+        # 填充半透明色块
+        cv2.fillPoly(overlay, [corners], color)
+        # 轮廓线（1px，同色但略亮）
+        cv2.polylines(img, [corners], isClosed=True,
+                      color=color, thickness=1, lineType=cv2.LINE_AA)
 
+    # 半透明叠加：alpha 控制 colormap 的不透明度
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
+    # 左上角标题（带黑色描边保证可读性）
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.65
+    thickness  = 2
+    pos        = (14, 28)
+    cv2.putText(img, title, pos, font, font_scale, (0, 0, 0),    thickness + 2, cv2.LINE_AA)
+    cv2.putText(img, title, pos, font, font_scale, (255, 255, 255), thickness,  cv2.LINE_AA)
+
+    return img
+
+
+def make_colorbar(width, height=20):
+    """
+    生成一条 INFERNO colorbar，宽度=width，高度=height，BGR 格式。
+    附带 0.0 / 0.5 / 1.0 刻度文字。
+    """
+    bar = np.zeros((height, width, 3), dtype=np.uint8)
+    for x in range(width):
+        bar[:, x] = val_to_inferno_bgr(x / max(width - 1, 1))
+
+    # 刻度文字
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for val, label in [(0.0, "0.0"), (0.5, "0.5"), (1.0, "1.0")]:
+        x = int(val * (width - 1))
+        cv2.putText(bar, label, (max(0, x - 10), height - 4),
+                    font, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+    return bar
+
+
+# ─────────────────────────────────────────────
+# 核心渲染函数
+# ─────────────────────────────────────────────
+
+def render_frame(img_bgr, patch_corners_uv, valid_mask,
+                 probs, expert_weights, frame_id, out_dir):
+    """
+    生成 2×2 四格热力图拼接图，带顶部信息栏和 colorbar。
+
+    四格布局（等大）：
+      [预测概率]  [Phys 权重]
+      [Geom 权重] [Tex  权重]
+    """
+    orig_h, orig_w = img_bgr.shape[:2]
+
+    # 将图像缩放到统一面板尺寸（保持原始宽高比）
+    PANEL_W, PANEL_H = 840, 468
+    img_resized = cv2.resize(img_bgr, (PANEL_W, PANEL_H), interpolation=cv2.INTER_AREA)
+
+    # patch 角点同步缩放到面板坐标
+    scale_x = PANEL_W / orig_w
+    scale_y = PANEL_H / orig_h
+    corners_scaled = patch_corners_uv.copy().astype(np.float32)
+    corners_scaled[:, :, 0] *= scale_x
+    corners_scaled[:, :, 1] *= scale_y
+    corners_scaled = corners_scaled.astype(np.int32)
+
+    # ── 计算有效 patch 平均权重（用于顶栏显示）──
     valid_idx = valid_mask > 0.5
-    if valid_idx.sum() > 0:
-        w_p = weights[0, valid_idx, 0].mean().item()
-        w_g = weights[0, valid_idx, 1].mean().item()
-        w_t = weights[0, valid_idx, 2].mean().item()
+    n_valid   = int(valid_idx.sum())
+    if n_valid > 0:
+        w_phys = float(expert_weights[valid_idx, 0].mean())
+        w_geom = float(expert_weights[valid_idx, 1].mean())
+        w_tex  = float(expert_weights[valid_idx, 2].mean())
+        avg_prob = float(probs[valid_idx].mean())
     else:
-        w_p, w_g, w_t = 0.0, 0.0, 0.0
-        
-    text_pred = f"Prediction | Phys:{w_p:.2f} Geom:{w_g:.2f} Tex(2D):{w_t:.2f}"
-    
-    header_h = 60
-    header_gt = np.zeros((header_h, w, 3), dtype=np.uint8)
-    header_gt[:] = (45, 45, 45)
-    header_pred = np.zeros((header_h, w, 3), dtype=np.uint8)
-    header_pred[:] = (45, 45, 45)
-    
-    cv2.putText(header_gt, "Ground Truth", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(header_pred, text_pred, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+        w_phys = w_geom = w_tex = avg_prob = 0.0
 
-    panel_gt = np.vstack([header_gt, img_gt])
-    panel_pred = np.vstack([header_pred, img_pred])
-    
-    final_canvas = np.hstack([panel_gt, panel_pred])
-    
-    MAX_OUT_WIDTH = 2560 
-    final_h, final_w = final_canvas.shape[:2]
-    if final_w > MAX_OUT_WIDTH:
-        scale_ratio = MAX_OUT_WIDTH / final_w
-        new_h = int(final_h * scale_ratio)
-        final_canvas = cv2.resize(final_canvas, (MAX_OUT_WIDTH, new_h), interpolation=cv2.INTER_AREA)
+    # ── 绘制四个面板 ──
+    # 1. 预测概率热力图
+    panel_pred = draw_heatmap_panel(
+        img_resized, corners_scaled, valid_mask,
+        values=probs,
+        title=f"Prediction  (avg={avg_prob:.2f})",
+        alpha=0.55,
+    )
 
-    save_path = Path(out_dir) / f"vis_{frame_id}_pred.jpg"
-    cv2.imwrite(str(save_path), final_canvas)
+    # 2. Phys 权重热力图（门控权重 w[:,0]）
+    panel_phys = draw_heatmap_panel(
+        img_resized, corners_scaled, valid_mask,
+        values=expert_weights[:, 0],
+        title=f"Phys expert  (w={w_phys:.2f})",
+        alpha=0.55,
+    )
+
+    # 3. Geom 权重热力图（门控权重 w[:,1]）
+    panel_geom = draw_heatmap_panel(
+        img_resized, corners_scaled, valid_mask,
+        values=expert_weights[:, 1],
+        title=f"Geom expert  (w={w_geom:.2f})",
+        alpha=0.55,
+    )
+
+    # 4. Tex 权重热力图（门控权重 w[:,2]）
+    panel_tex = draw_heatmap_panel(
+        img_resized, corners_scaled, valid_mask,
+        values=expert_weights[:, 2],
+        title=f"Tex expert   (w={w_tex:.2f})",
+        alpha=0.55,
+    )
+
+    # ── 2×2 拼接 ──
+    row_top    = np.hstack([panel_pred, panel_phys])
+    row_bottom = np.hstack([panel_geom, panel_tex])
+    grid       = np.vstack([row_top, row_bottom])
+
+    # ── colorbar（贴在 grid 底部）──
+    cb_h  = 24
+    cb    = make_colorbar(grid.shape[1], height=cb_h)
+    cb_bg = np.zeros((cb_h + 4, grid.shape[1], 3), dtype=np.uint8)
+    cb_bg[2:2 + cb_h] = cb
+    grid  = np.vstack([grid, cb_bg])
+
+    # ── 顶部信息栏 ──
+    total_w   = grid.shape[1]
+    header_h  = 52
+    header    = np.zeros((header_h, total_w, 3), dtype=np.uint8)
+    header[:] = (30, 30, 30)
+
+    info_text = (
+        f"Frame: {frame_id}    "
+        f"Valid patches: {n_valid}/63    "
+        f"Phys: {w_phys:.2f}  Geom: {w_geom:.2f}  Tex: {w_tex:.2f}    "
+        f"Avg pred prob: {avg_prob:.3f}"
+    )
+    cv2.putText(header, info_text, (16, 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+                (220, 220, 220), 1, cv2.LINE_AA)
+
+    # ── 最终画布 ──
+    canvas = np.vstack([header, grid])
+
+    # 等比例限宽（防止文件过大）
+    MAX_W = 2560
+    if canvas.shape[1] > MAX_W:
+        ratio  = MAX_W / canvas.shape[1]
+        canvas = cv2.resize(canvas, (MAX_W, int(canvas.shape[0] * ratio)),
+                            interpolation=cv2.INTER_AREA)
+
+    save_path = Path(out_dir) / f"vis_{frame_id}.jpg"
+    cv2.imwrite(str(save_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 92])
+
+
+# ─────────────────────────────────────────────
+# 主程序
+# ─────────────────────────────────────────────
 
 def main():
-    cfg = load_config()
+    cfg    = load_config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # ====================================================
-    # 【核心修复区】：绝对路径锚定机制 (与训练脚本保持一致)
-    # ====================================================
-    def get_abs_path(p_str):
-        p_str = str(p_str)
-        if p_str.startswith("./"):
-            return project_root / p_str[2:]
-        if Path(p_str).is_absolute():
-            return Path(p_str)
-        return project_root / p_str
 
-    npz_dir = get_abs_path(cfg["paths"]["output_dir"])
-    img_dir = get_abs_path(cfg["paths"]["raw_img_dir"])
-    vis_out_dir = get_abs_path(cfg["paths"].get("vis_output_dir", "./data/inference_vis_v9.8"))
-    json_gt_path = get_abs_path(cfg["paths"].get("manual_label_path", "./data/merged_visual_gt.json"))
-    
+    def get_abs(p):
+        p = str(p)
+        if p.startswith("./"): p = p[2:]
+        return project_root / p if not Path(p).is_absolute() else Path(p)
+
+    npz_dir     = get_abs(cfg["paths"]["output_dir"])
+    img_dir     = get_abs(cfg["paths"]["raw_img_dir"])
+    vis_out_dir = get_abs(cfg["paths"].get("vis_output_dir", "./data/inference_vis_v11"))
     vis_out_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 挂载人工真值库
-    manual_gt_dict = {}
-    if json_gt_path.exists():
-        with open(json_gt_path, "r", encoding="utf-8") as f:
-            manual_gt_dict = json.load(f)
-        print(f"✅ 成功加载人工真值标签库: {json_gt_path.name} (共 {len(manual_gt_dict)} 帧)")
-    else:
-        print(f"⚠️ 警告: 未找到人工标签库 {json_gt_path}，将全部使用 3D 伪标签！")
-    # ====================================================
 
-    print("⏳ 正在初始化 MoME E2E 架构与加载权重...")
+    # ── 模型加载 ──
+    print("⏳ 初始化 MoME 模型与加载权重...")
     dim_phys = cfg["features"]["phys"]["input_dim"]
-    dim_3d = cfg["features"]["3d"]["input_dim"]
-    model = MoMEEngine(dim_f3_stats=dim_phys, dim_f3_mae=dim_3d).to(device)
-    
-    weight_path = get_abs_path(cfg["paths"]["weights"]["mome_model"])
+    dim_3d   = cfg["features"]["3d"]["input_dim"]
+    model    = MoMEEngine(dim_f3_stats=dim_phys, dim_f3_mae=dim_3d).to(device)
+
+    weight_path = get_abs(cfg["paths"]["weights"]["mome_model"])
     if not weight_path.exists():
-        print(f"❌ 找不到最优权重文件: {weight_path}")
+        print(f"❌ 找不到权重文件: {weight_path}")
         return
-        
-    checkpoint = torch.load(weight_path, map_location=device, weights_only=False)
-    state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+    checkpoint       = torch.load(weight_path, map_location=device, weights_only=False)
+    state_dict       = checkpoint.get("model_state_dict", checkpoint)
     clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(clean_state_dict, strict=True)
     model.eval()
+    print(f"✅ 权重加载完成: {weight_path.name}  "
+          f"(best val F1={checkpoint.get('best_val_f1', 'N/A')})")
 
-    # ==========================================================
-    # 【核心重构：精准索引制导加载机制】
-    # ==========================================================
-    img_map = {}
-    
-    # 扩大索引文件的搜索半径，兼容根目录与 data 目录
-    possible_index_paths = [
-        project_root / "data" / "dataset_index.yaml",
-        project_root / "data" / "dataset_index.json",
-        project_root / "dataset_index.yaml",
-        project_root / "dataset_index.json"
-    ]
-    
-    index_loaded = False
-    for path in possible_index_paths:
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                if path.suffix == ".yaml":
-                    index_data = yaml.safe_load(f)
-                else:
-                    index_data = json.load(f)
-                # 强制转 str 防止 YAML 解析错误
-                img_map = {str(item["id"]): Path(item["img"]) for item in index_data}
-            print(f"📖 成功挂载标准数据集索引: {path} (共映射 {len(img_map)} 帧)")
-            index_loaded = True
-            break
-            
-    if not index_loaded:
-        print("⚠️ 未检测到 dataset_index.yaml/json，回退到 rglob 盲搜模式...")
-        all_imgs = list(img_dir.rglob("*.jpg"))
-        img_map = {p.stem: p for p in all_imgs}
-    # ==========================================================
-    
-    npz_files = sorted(list(npz_dir.glob("pkg_*.npz")))
+    # ── 数据扫描 ──
+    img_map    = {p.stem: p for p in img_dir.rglob("*.jpg")}
+    npz_files  = sorted(npz_dir.glob("pkg_*.npz"))
     valid_files = [f for f in npz_files if f.stem.replace("pkg_", "") in img_map]
-    
+
     limit = cfg.get("inference", {}).get("batch_limit", 20)
     if len(valid_files) > limit:
-        np.random.seed(42) 
-        test_files = np.random.choice(valid_files, limit, replace=False)
+        np.random.seed(42)
+        test_files = list(np.random.choice(valid_files, limit, replace=False))
     else:
         test_files = valid_files
 
-    print(f"🚀 启动【精准索引版】推理可视化 | 测试帧数: {len(test_files)}")
+    print(f"🚀 开始推理渲染 | 帧数: {len(test_files)} | 输出目录: {vis_out_dir}")
 
     with torch.no_grad():
         for npz_path in tqdm(test_files, desc="Inference & Render"):
             frame_id = npz_path.stem.replace("pkg_", "")
-            
+
             with np.load(npz_path, allow_pickle=True) as data:
-                f3_stats = torch.from_numpy(data["phys_8d"]).float().unsqueeze(0).to(device)
-                f3_mae = torch.from_numpy(data["deep_512d"]).float().unsqueeze(0).to(device)
-                q_2d = torch.from_numpy(data.get("quality_2d", np.ones((63, 1), dtype=np.float32))).float().unsqueeze(0).to(device)
-                patch_corners_uv = data["patch_corners_uv"]
-                meta = data["meta"]
-                
-            pseudo_label = meta[:, 0]
-            valid_mask = meta[:, 2]
-            
+                f3_stats         = torch.from_numpy(data["phys_8d"]).float().unsqueeze(0).to(device)
+                f3_mae           = torch.from_numpy(data["deep_512d"]).float().unsqueeze(0).to(device)
+                q_2d             = torch.from_numpy(
+                    data.get("quality_2d", np.ones((63, 1), dtype=np.float32))
+                ).float().unsqueeze(0).to(device)
+                patch_corners_uv = data["patch_corners_uv"]   # (63, 4, 2)，原始图像坐标
+                meta             = data["meta"]
+
+            valid_mask = meta[:, 2]   # (63,)
+
             img_path = img_map[frame_id]
-            try:
-                # 兼容 Windows/Linux 中文或复杂路径的绝对安全读取法
-                img_bgr = cv2.imdecode(np.fromfile(str(img_path), dtype=np.uint8), cv2.IMREAD_COLOR)
-            except Exception:
-                img_bgr = None
-                
+            img_bgr  = cv2.imread(str(img_path))
             if img_bgr is None:
-                print(f"\n⚠️ 无法读取图像: {img_path}")
+                print(f"⚠️ 图像读取失败: {img_path}")
                 continue
-            
+
             orig_h, orig_w = img_bgr.shape[:2]
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+            # 推理用缩放图
+            img_rgb     = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             img_resized = cv2.resize(img_rgb, (1008, 560))
-            img_tensor = img_transform(img_resized).unsqueeze(0).to(device)
-            
-            rois_tensor = generate_rois(patch_corners_uv, valid_mask, orig_w, orig_h).to(device)
-            valid_mask_tensor = torch.from_numpy(valid_mask).float().unsqueeze(0).to(device)
-            
-            final_logit, internals = model(img_tensor, rois_tensor, f3_stats, f3_mae, q_2d, valid_mask_tensor)
-            
-            probs = torch.sigmoid(final_logit).squeeze(0).cpu().numpy()
-            preds = (probs > 0.5).astype(np.float32)
-            weights = internals["weights"].cpu().numpy() 
-            
-            img_filename = f"{frame_id}.jpg"
-            if img_filename in manual_gt_dict:
-                gt_labels = np.array(manual_gt_dict[img_filename], dtype=np.float32)
-            else:
-                gt_labels = pseudo_label
-                
-            draw_inference_result(
-                img_bgr=img_bgr,
-                patch_corners_uv=patch_corners_uv,
-                valid_mask=valid_mask,
-                preds=preds,
-                gt_labels=gt_labels,
-                weights=weights,
-                frame_id=frame_id,
-                out_dir=vis_out_dir
+            img_tensor  = img_transform(img_resized).unsqueeze(0).to(device)
+
+            rois_tensor        = generate_rois(patch_corners_uv, valid_mask, orig_w, orig_h).to(device)
+            valid_mask_tensor  = torch.from_numpy(valid_mask).float().unsqueeze(0).to(device)
+
+            final_logit, internals = model(
+                img_tensor, rois_tensor, f3_stats, f3_mae, q_2d, valid_mask_tensor
             )
 
-    print(f"\n✨ 渲染完成! 结果已保存至: {vis_out_dir}")
+            # 提取结果
+            probs           = torch.sigmoid(final_logit).squeeze(0).cpu().numpy()   # (63,)
+            # expert_weights: (63, 3)，三个专家的门控权重
+            expert_weights  = internals["weights"].squeeze(0).cpu().numpy()
+
+            render_frame(
+                img_bgr          = img_bgr,
+                patch_corners_uv = patch_corners_uv,
+                valid_mask       = valid_mask,
+                probs            = probs,
+                expert_weights   = expert_weights,
+                frame_id         = frame_id,
+                out_dir          = vis_out_dir,
+            )
+
+    print(f"\n✨ 渲染完成！共输出 {len(test_files)} 张，保存至: {vis_out_dir}")
+
 
 if __name__ == "__main__":
     main()
